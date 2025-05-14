@@ -1,0 +1,1418 @@
+---
+title: "Amazon Comprehend Medical Test"
+author: "Morgan Manry"
+date: "April 23rd, 2025"
+output: word_document
+---
+
+## Initial Test
+
+*Select a Few Notes to Enter into AWS Comprehend Medical*
+
+```{r warning=FALSE, message=FALSE}
+library(jsonlite)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readxl)
+
+# import dataset via csv
+mimic_150 <- read_csv("mimic_sample_150(in).csv", 
+                      col_names = TRUE)
+
+# select a few note ID's to test (all are ICD10)
+test_ids <- c("10047766-DS-2", "14270780-DS-13", "16911678-DS-7", "19190876-DS-6", "19535007-DS-16")
+
+# limit notes to test_ids, generate "cleaned" note
+mimic_test <- mimic_150 |> 
+  filter(
+    note_id %in% test_ids
+  ) |> 
+  mutate(
+    clean_note = paste(input, 
+                       target, 
+                       sep = ". ")
+  )
+
+# generate list of ICD codes associated with this note_id
+mimic_test |> 
+  filter(
+    note_id == "10047766-DS-2"
+  ) |> 
+  dplyr::select(
+    starts_with("icd_code")
+  ) |> 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "icd_code_name", 
+    values_to = "icd_code_value") |> 
+  filter(
+    !is.na(icd_code_value)
+    ) |> 
+  pull(icd_code_value)
+
+# generate list of ICD code descriptions associated with this note_id
+mimic_test |> 
+  filter(
+    note_id == "10047766-DS-2"
+  ) |> 
+  dplyr::select(
+    starts_with("icd_desc")
+  ) |> 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "icd_desc_name", 
+    values_to = "icd_desc_value") |> 
+  pull(icd_desc_value)
+
+# generate notes 1 to 5
+for (i in 1:5) {
+  assign(paste0("note_", test_ids[i]), mimic_test$clean_note[i])
+  note_content <- mimic_test$clean_note[i]
+  writeLines(note_content, 
+             paste0("note_", 
+                    test_ids[i], 
+                    ".txt"))
+  
+  assign(paste0("bhc_", test_ids[i]), mimic_test$target[i])
+  note_content <- mimic_test$target[i]
+  writeLines(note_content, 
+             paste0("bhc_", 
+                    test_ids[i], 
+                    ".txt"))
+}
+```
+
+After inputting one or two notes into Amazon Comprehend Medical, I downloaded the JSON output and reviewed potential problems with the output. In future steps, I review 100 notes.
+
+```{r}
+# import JSON notes (testing two)
+json_DS_2_10047766 <- fromJSON("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/note_10047766-DS-2.json")
+json_DS_16_19535007 <- fromJSON("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/note_19535007-DS-16.json")
+
+# convert to dataframe, extract ICD-10-CM concepts
+DS_2_10047766 <- as.data.frame(json_DS_2_10047766)
+DS_16_19535007 <- as.data.frame(json_DS_16_19535007)
+
+icd_2_10047766 <- DS_2_10047766$Entities.ICD10CMConcepts
+icd_16_19535007 <- DS_16_19535007$Entities.ICD10CMConcepts
+
+# examples of output
+icd_2_10047766[[1]]
+icd_16_19535007[[3]]
+
+# bind rows, keep original index (index corresponds to medical entity)
+test_df <- bind_rows(icd_2_10047766,
+                     .id = "original_index")
+
+# count 'distinct' cases of codes
+test_df |> 
+  summarise(
+    distinct_codes = n_distinct(Code, na.rm = TRUE),
+    non_na_count = sum(!is.na(Code))
+  )
+
+# count 'distinct' cases of codes when filter score > 0.4
+test_df |> 
+  filter(
+    Score > 0.4
+  ) |> 
+  summarise(
+    distinct_codes = n_distinct(Code, na.rm = TRUE),
+    non_na_count = sum(!is.na(Code))
+  )
+
+# manually search if code is present
+test_df |> 
+  filter(Code == "Z86.711")
+
+# can also check phrases within ICD codes
+search_phrase <- "thrombosis"
+
+result <- test_df %>%
+  filter(
+    grepl(search_phrase, Description, ignore.case = TRUE)
+  ) 
+
+indices <- unique(result$original_index)
+
+View(result)
+print(indices)
+```
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 1.png")
+```
+
+Above is a screenshot of what the Real-Time Analysis function looks like in Amazon Comprehend Medical.
+
+## Final Test: 100 Notes
+
+After the first attempt to analyze between one to five notes, I will now analyze 99 notes (including DS_2_10047766 from earlier, we have 100). These notes ALL have ICD-10-CM codes and are under 10,000 characters.
+
+*Import MIMIC Note Dataset and Subset to Test Cases*
+
+
+```{r}
+# import updated MIMIC note dataset - subset of ~150 ICD-10-CM notes with shorter length
+mimic_10 <- read_csv("mimic_sample_150_ICD10_Apr11(in).csv",
+                         col_names = TRUE)
+
+# limit notes to test_ids, generate "cleaned" note
+mimic <- mimic_10 |> 
+  mutate(
+    clean_note = paste(input, target, sep = ". ")
+  ) |> 
+  mutate(
+    note_length = nchar(clean_note)
+  ) |> 
+  filter(
+    note_length <= 10000
+  ) |> 
+  select(
+    -subject_id, -hadm_id, -note_type, -note_seq, -charttime, -storetime, -discharge_note, -input, -input_tokens, -target_tokens, -note_no_spaces
+  )
+
+# verify length / structure of mimic data frame
+str(mimic)
+
+# I also want to add the test case we did earlier...from different the original csv file
+mimic_test <- read_csv("mimic_sample_150(in).csv",
+                       col_names = TRUE)
+
+# filter to specific note of interest, match format of above data frame
+mimic_test <- mimic_test |>
+  filter(
+    note_id == "10047766-DS-2"
+  ) |> 
+  select(
+    -subject_id, -hadm_id, -note_type, -note_seq, -charttime, -storetime, -input, -input_tokens, -target_tokens, -text
+  ) |> 
+  select(
+    -starts_with("icd_version_")
+  )
+
+# merge together into mimic_100 (100 notes)
+common_cols <- intersect(names(mimic), names(mimic_test))
+mimic_100 <- bind_rows(
+  select(mimic, all_of(common_cols)),
+  select(mimic_test, all_of(common_cols))
+)
+
+# generate list of ICD codes with a data frame each of ICD codes
+note_id <- mimic_100$note_id
+
+icd_code_list <- map(note_id, function(id) {
+  mimic |> 
+    filter(
+      note_id == id
+    ) |> 
+    select(
+      starts_with("icd_code")
+    ) |> 
+    pivot_longer(
+      cols = everything(),
+      names_to = "icd_code_name",
+      values_to = "icd_code_value") |> 
+    filter(
+      !is.na(icd_code_value)
+    )
+})
+
+# make this list more identifiable
+names(icd_code_list) <- paste0("note_", note_id)
+```
+
+
+*Extract Full Note as .txt Files*
+
+
+```{r, eval = FALSE}
+# generate text files for each cleaned note to input into AWS Comprehend Medical
+# evaluate once so don't have to re-generate each time
+for (i in 1:nrow(mimic)) {
+  assign(paste0("note_", note_id[i]), mimic$clean_note[i])
+  note_content <- mimic$clean_note[i]
+  writeLines(note_content, paste0("note_", note_id[i], ".txt"))
+}
+```
+
+
+*Extract Brief Hospital Courses as Separate .txt Files*
+
+For future use, extract the BHC as .txt files. Only evaluate once.
+
+```{r, eval = FALSE}
+# generate BHC as text files for each cleaned note to input into AWS Comprehend Medical
+# evaluate once so don't have to re-generate each time
+for (i in 1:nrow(mimic)) {
+  assign(paste0("bhc_", note_id[i]), mimic$target[i])
+  note_content <- mimic$target[i]
+  writeLines(note_content, paste0("bhc_", note_id[i], ".txt"))
+}
+```
+
+
+I merged the cleaned 'input' (preprocessed text w/ BHC removed) and 'target' (BHC only) rather than using the full text, which had several line breaks. These 100 notes (as .txt files) were put into an Amazon S3 bucket and submitted as an Analysis Job. After an analysis time of ~20-30 minutes, I downloaded the output as JSON files to be used in the next steps.
+
+*Generate 20 Copies of First Ten Notes*
+
+For repetition test.
+
+```{r, eval = FALSE}
+# specify output directory
+output_dir <- "/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/Repetition_Test"
+
+# for first 10 notes, generate 20 duplicates as their own .txt outputs
+for (i in 1:10) {
+  note_content <- mimic$clean_note[i]
+  note_id_value <- note_id[i]
+  for (j in 1:20) {
+    file_name <- paste0("note_", note_id_value, "_", j, ".txt")
+    file_path <- file.path(output_dir, file_name)
+    writeLines(note_content, file_path)
+  }
+}
+```
+
+
+*Generate ICD-10-CM Concepts from JSON Output for 100 Notes*
+
+Goal: read in JSON files, for a given note ID merge all small data frames (each data frame corresponds to a clinical entity) and keep only the distinct codes (there are likely several duplicates - select the code with the highest confidence score). Create another data frame where codes are filtered to confidence scores > 0.4. 
+
+```{r}
+# set folder path
+folder_path <- "/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/Results"
+
+# list all JSON files
+json_files <- list.files(path = folder_path, pattern = "\\.json$", full.names = TRUE)
+
+# initialize list to store results
+results_list <- list()
+
+# loop over each JSON file
+for (i in seq_along(json_files)) {
+  # convert to data frame
+  json_data <- fromJSON(json_files[i])
+  df <- as.data.frame(json_data)
+  
+  # extract Entities.ICD10CMConcepts
+  extracted_df <- df$Entities.ICD10CMConcepts
+  
+  # store in list
+  results_list[[i]] <- extracted_df
+}
+
+# name each list element with the file name
+names(results_list) <- basename(json_files)
+
+# add original index (name or number of source file)
+combined_df <- imap_dfr(results_list, function(sublist, file_name) {
+  # bind all small data frames inside one result
+  df <- bind_rows(sublist)
+  
+  # add index as original JSON file name
+  df$original_index <- file_name
+  return(df)
+})
+
+# clean combined_df
+combined_df <- combined_df |> 
+  mutate(
+    ID = original_index |> 
+      str_remove("^note_") |> 
+      str_remove("\\.txt\\.json$")
+  ) |> 
+  select(
+    ID, Code, Score, Description
+  )
+
+# keep only the distinct code with the highest confidence score
+distinct_df <- combined_df |> 
+  group_by(ID, Code) |> 
+  slice_max(Score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+head(distinct_df)
+
+# now filter by scores greater or equal to 0.4
+distinct_filtered_df <- distinct_df |> 
+  filter(
+    Score >= 0.4
+  )
+
+head(distinct_filtered_df)
+
+str(distinct_df)
+str(distinct_filtered_df)
+
+n_distinct(distinct_df$ID, na.rm = TRUE)
+n_distinct(distinct_filtered_df$ID, na.rm = TRUE)
+
+sum(is.na(distinct_df$Code))
+sum(is.na(distinct_filtered_df$Code))
+```
+
+*Repeat process for BHC notes*
+
+
+```{r}
+# set folder path
+folder_path <- "/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/BHC Results"
+
+# list all JSON files
+json_files <- list.files(path = folder_path, pattern = "\\.json$", full.names = TRUE)
+
+# initialize list to store results
+results_list <- list()
+
+# loop over each JSON file
+for (i in seq_along(json_files)) {
+  # convert to data frame
+  json_data <- fromJSON(json_files[i])
+  df <- as.data.frame(json_data)
+  
+  # extract Entities.ICD10CMConcepts
+  extracted_df <- df$Entities.ICD10CMConcepts
+  
+  # store in list
+  results_list[[i]] <- extracted_df
+}
+
+# name each list element with the file name
+names(results_list) <- basename(json_files)
+
+# add original index (name or number of source file)
+combined_df <- imap_dfr(results_list, function(sublist, file_name) {
+  # bind all small data frames inside one result
+  df <- bind_rows(sublist)
+  
+  # add index as original JSON file name
+  df$original_index <- file_name
+  return(df)
+})
+
+# clean combined_df
+combined_df <- combined_df |> 
+  mutate(
+    ID = original_index |> 
+      str_remove("^bhc_") |> 
+      str_remove("\\.txt\\.json$")
+  ) |> 
+  select(
+    ID, Code, Score, Description
+  )
+
+# keep only the distinct code with the highest confidence score
+distinct_bhc <- combined_df |> 
+  group_by(ID, Code) |> 
+  slice_max(Score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+head(distinct_bhc)
+
+# now filter by scores greater or equal to 0.4
+distinct_filtered_bhc <- distinct_bhc |> 
+  filter(
+    Score >= 0.4
+  )
+
+head(distinct_filtered_bhc)
+```
+
+
+*Comparison of Original ICD Codes to Extracted Amazon ICD Codes*
+
+From the original ICD code file, re-format so we can compare to the extracted Amazon ICD codes. 
+
+```{r}
+# pivot mimic dataset to long format
+long_mimic <- mimic_100 |> 
+  pivot_longer(
+    cols = starts_with("icd_"),
+    names_to = c(".value", "num"),
+    names_pattern = "icd_(code|desc)_(\\d+)"
+  ) |> 
+  rename(
+    ID = note_id,
+    Original_Code = code,
+    Description = desc
+  ) |> 
+  filter(
+    !is.na(Original_Code)
+  ) |> 
+  select(
+    ID, Original_Code, Description
+  )
+
+head(long_mimic)
+
+# drop any periods from ICD codes for comparability
+clean_codes <- function(x) {
+  x |> 
+    str_remove_all("\\.") |>
+    str_remove_all("\\s") |>
+    str_to_upper()
+}
+
+# apply clean_codes function to long_mimic (original codes)
+long_mimic_clean <- long_mimic |> 
+  mutate(
+    Original_Code = clean_codes(Original_Code)
+  )
+
+# apply clean_codes function to distinct_df (Amazon codes)
+distinct_df_clean <- distinct_df |> 
+  mutate(
+    Code = clean_codes(Code)
+  )
+
+# apply clean_codes function to distinct_df (Amazon codes w/ score>0.40)
+distinct_filtered_df_clean <- distinct_filtered_df |>
+  mutate(
+    Code = clean_codes(Code)
+  )
+
+# apply clean_codes function to distinct_bhc (Amazon codes - BHC)
+distinct_bhc_clean <- distinct_bhc |> 
+  mutate(
+    Code = clean_codes(Code)
+  )
+
+# apply clean_codes function to distinct_bhc (Amazon codes w/ score>0.40 - BHC)
+distinct_filtered_bhc_clean <- distinct_filtered_bhc |>
+  mutate(
+    Code = clean_codes(Code)
+  )
+
+# group by ID - merge original codes to Amazon results
+merged_df <- full_join(
+  long_mimic_clean |> 
+    group_by(ID) |> 
+    summarise(
+      orig_codes = list(unique(Original_Code))
+    ),
+  distinct_df_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+head(merged_df)
+
+# generate agreement between metrics for the distinct_df
+agreement_df <- merged_df |> 
+  mutate(
+    # count # of matches between the original and Amazon codes
+    matches = map2_int(orig_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    # generate total counts for Original and Amazon codes
+    total_orig = map_int(orig_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(orig_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+# statistics for evaluating amazon output for 
+head(agreement_df)
+agreement_df |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# group by ID for the filtered dataset
+merged_filtered_df <- full_join(
+  long_mimic_clean |> 
+    group_by(ID) |> 
+    summarise(
+      orig_codes = list(unique(Original_Code))
+    ),
+  distinct_filtered_df_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+print(merged_filtered_df)
+
+# generate agreement between metrics for the distinct_filtered_df
+agreement_filtered_df <- merged_filtered_df |> 
+  mutate(
+    matches = map2_int(orig_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(orig_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+head(agreement_filtered_df)
+agreement_filtered_df |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+```
+
+*Group-Level Matching: ONLY first 3 characters*
+
+Category-level or trimmed matching - subset to first three characters. Perform for both filtered and unfiltered datasets.
+
+```{r}
+group_match_df <- merged_df |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    orig_prefix = map(orig_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(orig_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(orig_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(group_match_df)
+group_match_df |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# now apply when confidence scores are filtered >0.40
+filtered_group_match_df <- merged_filtered_df |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    orig_prefix = map(orig_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(orig_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(orig_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(filtered_group_match_df)
+filtered_group_match_df |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+```
+
+*Evaluate Predicted Amazon Codes for Brief Hospital Courses (BHC)*
+
+```{r}
+# group by ID - merge original codes to Amazon results
+merged_bhc <- full_join(
+  long_mimic_clean |> 
+    group_by(ID) |> 
+    summarise(
+      orig_codes = list(unique(Original_Code))
+    ),
+  distinct_bhc_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+head(merged_bhc)
+
+# generate agreement between metrics for the distinct_df
+agreement_bhc <- merged_bhc |> 
+  mutate(
+    # count # of matches between the original and Amazon codes
+    matches = map2_int(orig_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    # generate total counts for Original and Amazon codes
+    total_orig = map_int(orig_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(orig_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+# statistics for evaluating amazon output for 
+head(agreement_bhc)
+agreement_bhc |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# group by ID for the filtered dataset - BHC
+merged_filtered_bhc <- full_join(
+  long_mimic_clean |> 
+    group_by(ID) |> 
+    summarise(
+      orig_codes = list(unique(Original_Code))
+    ),
+  distinct_filtered_bhc_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+head(merged_filtered_bhc)
+
+# generate agreement between metrics for the distinct_filtered_df
+agreement_filtered_bhc <- merged_filtered_bhc |> 
+  mutate(
+    matches = map2_int(orig_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(orig_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+head(agreement_filtered_bhc)
+agreement_filtered_bhc |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+```
+
+*BHC Test: Category Level Matching*
+
+```{r}
+group_match_bhc <- merged_bhc |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    orig_prefix = map(orig_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(orig_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(orig_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(group_match_bhc)
+group_match_bhc |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# now apply when confidence scores are filtered >0.40
+filtered_group_match_bhc <- merged_filtered_bhc |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    orig_prefix = map(orig_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(orig_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_orig = map_int(orig_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_orig + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(orig_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_orig > 0,
+                    matches / total_orig,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_orig, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(filtered_group_match_bhc)
+filtered_group_match_bhc |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+```
+
+
+*Repetition Test* 
+
+In this test, I ran 10 notes 20 times each. We want to measure within-tool variation. If the JSON output is the same after running 20 times, we can confirm that this NLP/NER tool is consistent between runs.
+
+```{r}
+folder_path <- "/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/Repetition_Test_Results"
+
+# list all .json files
+json_files <- list.files(path = folder_path, pattern = "\\.txt\\.json$", full.names = TRUE)
+
+# extract note ID (e.g. 10120925-DS-19)
+file_info <- tibble(
+  filepath = json_files,
+  filename = basename(json_files),
+  base_id = str_extract(filename, "(?<=note_)(.*?)(?=_[0-9]+\\.txt\\.json)"),
+  replicate = str_extract(filename, "_\\d+(?=\\.txt\\.json)") |> 
+              str_remove("_") |> 
+              as.integer()
+)
+
+# group by note_id - read all JSONS within group, compare to first one
+results <- file_info |> 
+  group_by(base_id) |> 
+  summarise(
+    all_identical = {
+      contents <- map(filepath, ~ fromJSON(.x))
+      all(map_lgl(contents[-1], ~ identical(.x, contents[[1]])))
+    },
+    total_files = n()
+  )
+
+print(results)
+```
+
+*Comparison to Expert-Reviewed ICD-10-CM Codes*
+
+In the working group, we requested a clinician to manually review 15 notes. Of these notes, a subset were available to run in Amazon Comprehend Medical due to the note limit of 10,000 characters. For this subset, we compare to the predicted Amazon ICD-10-CM codes.
+
+
+```{r}
+# read in manually coded / expert reviewed ICD-10-predicted codes for 15 notes
+expert <- read_excel("clinician_reviewed_icd10.xlsx")
+
+# remove irrelevat columns
+expert <- expert |> 
+  select(
+    -subject_id, -hadm_id, -note_no_spaces
+  )
+
+# pivot longer for comparabilitiy
+long_expert <- expert |> 
+  pivot_longer(
+    cols = starts_with("icd_"),
+    names_to = c(".value", "num"),
+    names_pattern = "icd_(code|desc)_(\\d+)"
+  ) |> 
+  rename(
+    ID = note_id,
+    Original_Code = code,
+    Description = desc
+  ) |> 
+  filter(
+    !is.na(Original_Code)
+  ) |> 
+  select(
+    ID, Original_Code, Description
+  )
+
+head(long_expert)
+
+# apply clean_codes function to long_expert
+long_expert_clean <- long_expert |> 
+  mutate(
+    Original_Code = clean_codes(Original_Code)
+  )
+
+# group by ID - merge expert codes (our 'gold standard' to Amazon results
+expert_amazon <- inner_join(
+  long_expert_clean |> 
+    group_by(ID) |> 
+    summarise(
+      expert_codes = list(unique(Original_Code))
+    ),
+  distinct_df_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+head(expert_amazon)
+
+expert_amazon_stats <- expert_amazon |> 
+  mutate(
+    # count # of matches between the original and Amazon codes
+    matches = map2_int(expert_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    # generate total counts for Original and Amazon codes
+    total_expert = map_int(expert_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_expert + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(expert_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_expert > 0,
+                    matches / total_expert,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_expert, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+# statistics for evaluating amazon output for 
+expert_amazon_stats |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# Filtered by Confidence Score > 0.40
+expert_amazon_filtered <- inner_join(
+  long_expert_clean |> 
+    group_by(ID) |> 
+    summarise(
+      expert_codes = list(unique(Original_Code))
+    ),
+  distinct_filtered_df_clean |> 
+    group_by(ID) |>  
+    summarise(
+      amazon_codes = list(unique(Code))
+      ),
+  by = "ID"
+) 
+
+head(expert_amazon_filtered)
+
+expert_amazon_filtered_stats <- expert_amazon_filtered |> 
+  mutate(
+    # count # of matches between the original and Amazon codes
+    matches = map2_int(expert_codes, amazon_codes, ~length(intersect(.x, .y))),
+    
+    # generate total counts for Original and Amazon codes
+    total_expert = map_int(expert_codes, length),
+    total_amazon = map_int(amazon_codes, length),
+    
+    avg_total = (total_expert + total_amazon) / 2,
+    
+    # percent_match - 'what percentage of codes match, relative to average number of total codes across both sets?'
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index
+    jaccard = map2_dbl(expert_codes, amazon_codes, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    # precision
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    # recall
+    recall = ifelse(total_expert > 0,
+                    matches / total_expert,
+                    NA_real_),
+    
+    # F1 Score
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_expert, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(desc(recall))
+
+expert_amazon_filtered_stats |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# Category Level Matching: Expert vs. Amazon
+
+group_expert_amazon <- expert_amazon |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    expert_prefix = map(expert_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(expert_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_expert = map_int(expert_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_expert + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(expert_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_expert > 0,
+                    matches / total_expert,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_expert, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(group_expert_amazon)
+
+group_expert_amazon |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+# Group-Level Matching for Filtered Amazon vs. Expert
+
+group_expert_amazon_filtered <- expert_amazon_filtered |> 
+  mutate(
+    # Use only the first 3 characters of each code
+    expert_prefix = map(expert_codes, ~ substr(.x, 1, 3)),
+    amazon_prefix = map(amazon_codes, ~ substr(.x, 1, 3)),
+    
+    # Count matches based on prefix intersection
+    matches = map2_int(expert_prefix, amazon_prefix, ~ length(intersect(.x, .y))),
+    
+    total_expert = map_int(expert_prefix, length),
+    total_amazon = map_int(amazon_prefix, length),
+    
+    avg_total = (total_expert + total_amazon) / 2,
+    
+    percent_match = ifelse(avg_total > 0, 
+                           round(matches / avg_total * 100, 1), 
+                           NA),
+    
+    # Jaccard index based on prefix match
+    jaccard = map2_dbl(expert_prefix, amazon_prefix, ~{
+      intersection <- intersect(.x, .y)
+      union_set <- union(.x, .y)
+      if (length(union_set) > 0) {
+        length(intersection) / length(union_set)
+      } else {
+        NA_real_
+      }
+    }),
+    
+    precision = ifelse(total_amazon > 0,
+                       matches / total_amazon,
+                       NA_real_),
+    
+    recall = ifelse(total_expert > 0,
+                    matches / total_expert,
+                    NA_real_),
+    
+    f1_score = ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                      2 * (precision * recall) / (precision + recall),
+                      NA_real_)
+  ) |> 
+  select(
+    ID, percent_match, matches, total_expert, total_amazon, jaccard, precision, recall, f1_score
+  ) |> 
+  arrange(
+    desc(recall)
+  )
+
+head(group_expert_amazon_filtered)
+
+group_expert_amazon_filtered |> 
+  summarise(
+    across(c(recall, jaccard, precision, f1_score),
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+```
+
+
+*Relevant Screenshots*
+
+Below is an image of the Named Entity Recognition within the user interface of Amazon Comprehend Medical.
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 2.png")
+```
+
+A given diagnosis is presented as an 'entity' (e.g., skull lesion) with 5 possible ICD-10-CM codes associated with that skull lesion. Amazon provides a confidence score based on how confident they are in that prediction. Codes can repeat across different named entities - hence, why we filter by distinct codes and select the highest one in this analysis.
+
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 3.png")
+```
+
+To import the data, all .txt files generated were imported into a S3 Bucket (like Dropbox for Amazon). 
+
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 4.png")
+```
+
+
+An input-data folder was created to store the .txt files, and a results folder was created to store the output .json files.
+
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 5.png")
+```
+
+I submitted two analysis jobs. One job analyzed the 100 notes and resulted the predicted ICD-10-CM codes as JSON files. One job analyzed 10 notes 20 times each. Each job took 20-30 minutes total.
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 6.png")
+```
+
+
+After analysis, I checked the note that I looked at in-depth during HW2. The results are consistent with what I found then - 13 total matches assuming the 21 in the patient's chart were correct. 474 distinct codes were produced by Amazon. This helped confirm that this analysis was correct.
+
+
+```{r, echo=FALSE}
+knitr::include_graphics("/Users/morganmanry/Desktop/UTHealth/Big Data in Practice/medical_entities_test/AWS Image 7.png")
+```
